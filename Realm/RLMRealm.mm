@@ -374,11 +374,7 @@ NSString * const c_defaultRealmFileName = @"default.realm";
     }
 
     // try to reuse existing realm first
-    RLMRealm *realm = nil;
-    if (!dynamic) {
-        realm = cachedRealm(path);
-    }
-
+    RLMRealm *realm = cachedRealm(path);
     if (realm) {
         // if already opened with different read permissions then throw
         if (realm->_readOnly != readonly) {
@@ -389,6 +385,11 @@ NSString * const c_defaultRealmFileName = @"default.realm";
         if (realm->_inMemory != inMemory) {
             @throw [NSException exceptionWithName:@"RLMException"
                                            reason:@"Realm at path already opened with different inMemory settings"
+                                         userInfo:@{@"path":realm.path}];
+        }
+        if (realm->_dynamic != dynamic || (customSchema && ![customSchema isEqualToSchema:realm->_schema])) {
+            @throw [NSException exceptionWithName:@"RLMException"
+                                           reason:@"Realm at path already opened with different schema"
                                          userInfo:@{@"path":realm.path}];
         }
 
@@ -440,17 +441,18 @@ NSString * const c_defaultRealmFileName = @"default.realm";
             }
             RLMRealmSetSchema(self, [RLMSchema sharedSchema], true);
             RLMRealmCreateAccessors(_schema);
-
-            cacheRealm(self, _path);
         }
         else {
-            // check cache for existing cached realms with the same path
-            NSArray *realms = realmsAtPath(_path);
-            if (realms.count) {
-                // if we have a cached realm on another thread, copy without a transaction
-                RLMRealmSetSchema(self, [realms[0] schema], false);
+            // check cache for existing cached non-dynamic realms with the same path
+            for (RLMRealm *cachedRealm in realmsAtPath(_path)) {
+                if (!cachedRealm->_dynamic) {
+                    // copy the existing schema without a transaction or validation
+                    RLMRealmSetSchema(self, cachedRealm->_schema, false);
+                    break;
+                }
             }
-            else {
+
+            if (!_schema) {
                 // if we are the first realm at this path, set/align schema or perform migration if needed
                 NSUInteger schemaVersion = RLMRealmSchemaVersion(self);
                 if (s_currentSchemaVersion == schemaVersion || schemaVersion == RLMNotVersioned) {
@@ -462,14 +464,14 @@ NSString * const c_defaultRealmFileName = @"default.realm";
 
                 RLMRealmCreateAccessors(_schema);
             }
-
-            cacheRealm(self, _path);
         }
 
         if (!readonly) {
             // initializing the schema started a read transaction, so end it
             [self invalidate];
         }
+
+        cacheRealm(self, _path);
     }
 }
 
@@ -811,10 +813,18 @@ static void CheckReadWrite(RLMRealm *realm, NSString *msg=@"Cannot write to a re
 
 + (NSError *)migrateRealmAtPath:(NSString *)realmPath key:(NSData *)key {
     NSError *error;
-    RLMRealm *realm = [[RLMRealm alloc] initWithPath:realmPath key:key readOnly:NO inMemory:NO error:&error];
-    if (!error) {
-        [realm initializeSchema:nil dynamic:YES readonly:NO key:key];
-        error = [self migrateRealm:realm key:key];
+    @synchronized (s_realmsPerPath) {
+        // Checking the count is unreliable as weak pointers which have become
+        // nil are only removed the next time the map table is mutated
+        if ([s_realmsPerPath[realmPath] objectEnumerator].nextObject) {
+            @throw [NSException exceptionWithName:@"RLMException" reason:@"Cannot migrate a realm which is already open" userInfo:nil];
+        }
+
+        RLMRealm *realm = [[RLMRealm alloc] initWithPath:realmPath key:key readOnly:NO inMemory:NO error:&error];
+        if (!error) {
+            [realm initializeSchema:nil dynamic:YES readonly:NO key:key];
+            error = [self migrateRealm:realm key:key];
+        }
     }
     return error;
 }
